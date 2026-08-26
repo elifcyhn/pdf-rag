@@ -33,8 +33,11 @@ logger = logging.getLogger(__name__)
 ANSWER_PROMPT = PromptTemplate.from_template("""
 Answer the question using only information explicitly found in the PDF context below.
 If the context does not contain the answer, do not guess, infer, or add general knowledge.
-In that case, write exactly this sentence and nothing else: This information was not found in the uploaded documents.
-Answer in English.
+Detect the primary language of the question and answer in that same language.
+If the answer is absent from the context, respond only with the natural equivalent of
+"This information was not found in the uploaded documents." in the question's language.
+For Turkish, write exactly: Bu bilgi yüklenen belgelerde bulunamadı.
+For English, write exactly: This information was not found in the uploaded documents.
 
 Context:
 {context}
@@ -45,7 +48,13 @@ Answer:
 
 
 def initialize_session() -> None:
-    for key, value in {"conversation": None, "messages": [], "document_names": []}.items():
+    defaults = {
+        "conversation": None,
+        "messages": [],
+        "document_names": [],
+        "uploader_key": 0,
+    }
+    for key, value in defaults.items():
         if key not in st.session_state:
             st.session_state[key] = value
 
@@ -238,20 +247,31 @@ def source_labels(source_documents: list[Document]) -> list[str]:
     ]
 
 
-def reset_chat() -> None:
+def clear_documents() -> None:
     st.session_state.conversation = None
     st.session_state.messages = []
     st.session_state.document_names = []
+    st.session_state.uploader_key += 1
+
+
+def clear_chat() -> None:
+    conversation = st.session_state.conversation
+    if conversation is not None and conversation.memory is not None:
+        conversation.memory.clear()
+    st.session_state.messages = []
 
 
 def render_styles() -> None:
     st.markdown("""
         <style>
-        .block-container { max-width: 920px; padding-top: 2.2rem; }
-        [data-testid="stChatMessage"] { border: 1px solid color-mix(in srgb, currentColor 12%, transparent); border-radius: 18px; padding: .45rem .75rem; margin-bottom: .75rem; }
+        .block-container { max-width: 920px; padding-top: 2rem; padding-bottom: 5rem; }
+        [data-testid="stSidebar"] { border-right: 1px solid color-mix(in srgb, currentColor 10%, transparent); }
+        [data-testid="stChatMessage"] { border: 1px solid color-mix(in srgb, currentColor 12%, transparent); border-radius: 18px; padding: .55rem .8rem; margin-bottom: .8rem; }
         [data-testid="stChatInput"] { border-radius: 18px; }
         .status-card { padding: .8rem 1rem; border-radius: 14px; background: color-mix(in srgb, #4f7cff 10%, transparent); border: 1px solid color-mix(in srgb, #4f7cff 25%, transparent); margin-bottom: 1rem; }
         .source-chip { display: inline-block; padding: .2rem .55rem; margin: .15rem .25rem .15rem 0; border-radius: 999px; background: color-mix(in srgb, #4f7cff 13%, transparent); font-size: .78rem; }
+        .source-heading { margin-top: .75rem; font-size: .78rem; font-weight: 600; opacity: .75; }
+        .source-note { margin-top: .25rem; font-size: .72rem; opacity: .62; }
         </style>
     """, unsafe_allow_html=True)
 
@@ -259,7 +279,12 @@ def render_styles() -> None:
 def render_sources(sources: list[str]) -> None:
     if sources:
         chips = "".join(f'<span class="source-chip">{html.escape(label)}</span>' for label in sources)
-        st.markdown(f"<div>{chips}</div>", unsafe_allow_html=True)
+        st.markdown(
+            '<div class="source-heading">Sources</div>'
+            f"<div>{chips}</div>"
+            '<div class="source-note">Sources identify the PDF pages of the retrieved text chunks; they are not definitive academic citations.</div>',
+            unsafe_allow_html=True,
+        )
 
 
 def render_sidebar() -> None:
@@ -270,12 +295,19 @@ def render_sidebar() -> None:
             f"Up to {MAX_PDF_FILES} PDFs · {MAX_FILE_SIZE_MB} MB per file · "
             f"{MAX_TOTAL_PAGES} pages in total"
         )
-        files = st.file_uploader("PDF files", type=["pdf"], accept_multiple_files=True, label_visibility="collapsed")
+        files = st.file_uploader(
+            "PDF files",
+            type=["pdf"],
+            accept_multiple_files=True,
+            label_visibility="collapsed",
+            key=f"pdf_uploader_{st.session_state.uploader_key}",
+        )
         if st.button("Process documents", type="primary", use_container_width=True, disabled=not files):
             if not get_google_api_key():
                 st.error("GOOGLE_API_KEY or GEMINI_API_KEY was not found in the `.env` file.")
             else:
-                with st.spinner("Reading and indexing documents..."):
+                with st.status("Preparing documents...", expanded=True) as document_status:
+                    st.write("Validating files and extracting text...")
                     file_payloads = create_file_payloads(files)
                     file_fingerprints = tuple(
                         (name, content_hash)
@@ -288,19 +320,30 @@ def render_sidebar() -> None:
                         st.warning("Files that could not be processed:\n\n" + "\n\n".join(
                             f"- {message}" for message in rejected_files
                         ))
-                    chunks = split_documents(pages) if pages else []
                     if not chunks:
+                        document_status.update(
+                            label="No documents were processed.", state="error"
+                        )
                         st.error("No processable text was found. Try a text-based PDF.")
                     else:
                         try:
+                            st.write("Creating the search index...")
                             st.session_state.conversation = build_conversation(
                                 chunks, file_fingerprints
                             )
                             st.session_state.messages = []
                             st.session_state.document_names = processed_names
+                            document_status.update(
+                                label="Documents are ready.",
+                                state="complete",
+                                expanded=False,
+                            )
                             st.success(f"{len(processed_names)} PDF(s) and {len(chunks)} chunks are ready.")
                         except Exception:
                             logger.exception("Could not index documents")
+                            document_status.update(
+                                label="Document processing failed.", state="error"
+                            )
                             st.error("The documents could not be prepared. Please try again later.")
         if st.session_state.document_names:
             st.divider()
@@ -308,8 +351,13 @@ def render_sidebar() -> None:
             for name in st.session_state.document_names:
                 st.markdown(f"✓ {name}")
         st.divider()
-        st.button("Clear chat and documents", on_click=reset_chat, use_container_width=True)
-        st.caption("Files are kept in memory only for this session.")
+        st.button(
+            "Clear documents",
+            on_click=clear_documents,
+            use_container_width=True,
+            disabled=not st.session_state.document_names,
+        )
+        st.caption("Active documents are attached only to this session.")
 
 
 def render_message(message: dict) -> None:
@@ -326,8 +374,16 @@ def main() -> None:
     render_sidebar()
 
     st.title("💬 PDF Assistant")
-    st.caption("Chat naturally with your documents and see which pages support each answer.")
-    st.caption("Source pages are a helpful indicator, not a definitive academic citation.")
+    header_text, header_action = st.columns([5, 1.2], vertical_alignment="center")
+    with header_text:
+        st.caption("Ask questions, explore ideas, and find answers grounded in your PDF documents.")
+    with header_action:
+        st.button(
+            "Clear chat",
+            on_click=clear_chat,
+            use_container_width=True,
+            disabled=not st.session_state.messages,
+        )
     if st.session_state.conversation is None:
         st.markdown('<div class="status-card">👈 To begin, upload PDFs from the sidebar and select <b>Process documents</b>.</div>', unsafe_allow_html=True)
         with st.chat_message("assistant", avatar="✨"):
@@ -343,7 +399,7 @@ def main() -> None:
     st.session_state.messages.append(user_message)
     render_message(user_message)
     with st.chat_message("assistant", avatar="✨"):
-        with st.spinner("Searching the documents..."):
+        with st.spinner("Preparing your answer..."):
             try:
                 response = st.session_state.conversation.invoke({"question": prompt})
                 answer = response.get("answer", "No answer could be generated.")
