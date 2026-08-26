@@ -1,0 +1,17 @@
+MAX_PDF_FILES = 5
+MAX_FILE_SIZE_MB = 20
+MAX_TOTAL_PAGES = 500
+PDF_MIME_TYPES = {"application/pdf", "application/x-pdf"}
+
+CHUNK_SIZE = 1200
+CHUNK_OVERLAP = 200
+CHUNK_SEPARATORS = ["\n\n", "\n", ". ", " ", ""]
+
+CHAT_MEMORY_TURNS = 6
+RETRIEVER_DOCUMENT_COUNT = 4
+EMBEDDING_MODEL = "models/gemini-embedding-2"
+CHAT_MODEL = "gemini-3.6-flash"
+CHAT_TEMPERATURE = 0.2
+
+CACHE_TTL_SECONDS = 3600
+CACHE_MAX_ENTRIES = 32
