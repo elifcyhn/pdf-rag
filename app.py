@@ -1,13 +1,15 @@
 import html
+import hashlib
 import logging
 import os
 from collections import defaultdict
+from io import BytesIO
 from pathlib import Path
 
 import streamlit as st
 from dotenv import load_dotenv
 from langchain.chains import ConversationalRetrievalChain
-from langchain.memory import ConversationBufferMemory
+from langchain.memory import ConversationBufferWindowMemory
 from langchain_community.vectorstores import FAISS
 from langchain_core.documents import Document
 from langchain_core.prompts import PromptTemplate
@@ -19,6 +21,10 @@ from PyPDF2 import PdfReader
 MAX_PDF_FILES = 5
 MAX_FILE_SIZE_MB = 20
 MAX_TOTAL_PAGES = 500
+CHAT_MEMORY_TURNS = 6
+CACHE_TTL_SECONDS = 3600
+CACHE_MAX_ENTRIES = 32
+EMBEDDING_MODEL = "models/gemini-embedding-2"
 PDF_MIME_TYPES = {"application/pdf", "application/x-pdf"}
 
 logger = logging.getLogger(__name__)
@@ -42,6 +48,27 @@ def initialize_session() -> None:
     for key, value in {"conversation": None, "messages": [], "document_names": []}.items():
         if key not in st.session_state:
             st.session_state[key] = value
+
+
+class InMemoryUpload(BytesIO):
+    def __init__(self, name: str, file_type: str | None, content: bytes) -> None:
+        super().__init__(content)
+        self.name = name
+        self.type = file_type
+        self.size = len(content)
+
+
+def create_file_payloads(files) -> tuple[tuple[str, str | None, bytes, str], ...]:
+    payloads = []
+    for uploaded_file in files:
+        content = uploaded_file.getvalue()
+        payloads.append((
+            uploaded_file.name,
+            getattr(uploaded_file, "type", None),
+            content,
+            hashlib.sha256(content).hexdigest(),
+        ))
+    return tuple(payloads)
 
 
 def validate_uploaded_files(files) -> tuple[list, list[str]]:
@@ -120,20 +147,72 @@ def split_documents(documents: list[Document]) -> list[Document]:
     ).split_documents(documents)
 
 
+@st.cache_data(ttl=CACHE_TTL_SECONDS, max_entries=CACHE_MAX_ENTRIES, show_spinner=False)
+def process_pdf_payloads(
+    payloads: tuple[tuple[str, str | None, bytes, str], ...],
+) -> tuple[list[Document], list[str], list[str]]:
+    files = []
+    for name, file_type, content, content_hash in payloads:
+        if hashlib.sha256(content).hexdigest() != content_hash:
+            logger.error("PDF cache fingerprint mismatch: %s", name)
+            return [], [f"{name}: The file could not be verified."], []
+        files.append(InMemoryUpload(name, file_type, content))
+
+    valid_files, validation_errors = validate_uploaded_files(files)
+    pages, processing_errors, processed_names = extract_pdf_pages(valid_files)
+    chunks = split_documents(pages) if pages else []
+    return chunks, validation_errors + processing_errors, processed_names
+
+
 def get_google_api_key() -> str | None:
     return os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
 
 
-def build_conversation(documents: list[Document]):
-    api_key = get_google_api_key()
-    vectorstore = FAISS.from_documents(
-        documents=documents,
-        embedding=GoogleGenerativeAIEmbeddings(
-            model="models/gemini-embedding-2", google_api_key=api_key
-        ),
+def create_document_payloads(
+    documents: list[Document],
+) -> tuple[tuple[str, tuple[tuple[str, str | int], ...]], ...]:
+    return tuple(
+        (document.page_content, tuple(sorted(document.metadata.items())))
+        for document in documents
     )
-    memory = ConversationBufferMemory(
-        memory_key="chat_history", output_key="answer", return_messages=True
+
+
+@st.cache_data(ttl=CACHE_TTL_SECONDS, max_entries=CACHE_MAX_ENTRIES, show_spinner=False)
+def get_cached_document_embeddings(
+    document_payloads: tuple[tuple[str, tuple[tuple[str, str | int], ...]], ...],
+    file_fingerprints: tuple[tuple[str, str], ...],
+) -> list[list[float]]:
+    del file_fingerprints  # Included only to bind the cache entry to names and content hashes.
+    embedding_client = GoogleGenerativeAIEmbeddings(
+        model=EMBEDDING_MODEL,
+        google_api_key=get_google_api_key(),
+    )
+    return embedding_client.embed_documents([text for text, _ in document_payloads])
+
+
+def build_conversation(
+    documents: list[Document], file_fingerprints: tuple[tuple[str, str], ...]
+):
+    api_key = get_google_api_key()
+    embedding_client = GoogleGenerativeAIEmbeddings(
+        model=EMBEDDING_MODEL,
+        google_api_key=api_key,
+    )
+    document_payloads = create_document_payloads(documents)
+    vectors = get_cached_document_embeddings(document_payloads, file_fingerprints)
+    vectorstore = FAISS.from_embeddings(
+        text_embeddings=(
+            (text, vector)
+            for (text, _), vector in zip(document_payloads, vectors, strict=True)
+        ),
+        embedding=embedding_client,
+        metadatas=(dict(metadata) for _, metadata in document_payloads),
+    )
+    memory = ConversationBufferWindowMemory(
+        memory_key="chat_history",
+        output_key="answer",
+        return_messages=True,
+        k=CHAT_MEMORY_TURNS,
     )
     return ConversationalRetrievalChain.from_llm(
         llm=ChatGoogleGenerativeAI(
@@ -197,9 +276,14 @@ def render_sidebar() -> None:
                 st.error("GOOGLE_API_KEY or GEMINI_API_KEY was not found in the `.env` file.")
             else:
                 with st.spinner("Reading and indexing documents..."):
-                    valid_files, validation_errors = validate_uploaded_files(files)
-                    pages, processing_errors, processed_names = extract_pdf_pages(valid_files)
-                    rejected_files = validation_errors + processing_errors
+                    file_payloads = create_file_payloads(files)
+                    file_fingerprints = tuple(
+                        (name, content_hash)
+                        for name, _, _, content_hash in file_payloads
+                    )
+                    chunks, rejected_files, processed_names = process_pdf_payloads(
+                        file_payloads
+                    )
                     if rejected_files:
                         st.warning("Files that could not be processed:\n\n" + "\n\n".join(
                             f"- {message}" for message in rejected_files
@@ -209,7 +293,9 @@ def render_sidebar() -> None:
                         st.error("No processable text was found. Try a text-based PDF.")
                     else:
                         try:
-                            st.session_state.conversation = build_conversation(chunks)
+                            st.session_state.conversation = build_conversation(
+                                chunks, file_fingerprints
+                            )
                             st.session_state.messages = []
                             st.session_state.document_names = processed_names
                             st.success(f"{len(processed_names)} PDF(s) and {len(chunks)} chunks are ready.")
