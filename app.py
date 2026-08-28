@@ -66,6 +66,9 @@ def render_sources(sources: list[str]) -> None:
 
 def render_sidebar() -> None:
     max_files, max_file_size_mb, max_total_pages = pdf_service.get_upload_limits()
+    ocr_default, ocr_language_labels, ocr_default_language = (
+        pdf_service.get_ocr_options()
+    )
     with st.sidebar:
         st.title("📚 Documents")
         st.caption("Upload your PDFs and ask the assistant to use only information from them.")
@@ -80,6 +83,26 @@ def render_sidebar() -> None:
             label_visibility="collapsed",
             key=f"pdf_uploader_{st.session_state.uploader_key}",
         )
+        enable_ocr = st.checkbox(
+            "Use local OCR for scanned PDFs",
+            value=ocr_default,
+            help=(
+                "OCR is attempted only for PDFs with no selectable text "
+                "on any page."
+            ),
+        )
+        ocr_language = None
+        if enable_ocr:
+            ocr_language_label = st.selectbox(
+                "OCR language",
+                options=ocr_language_labels,
+                index=ocr_language_labels.index(ocr_default_language),
+            )
+            ocr_language = pdf_service.get_ocr_language_code(ocr_language_label)
+            st.caption(
+                "OCR may take a while. Partially scanned PDFs are outside "
+                "the scope of this version."
+            )
         if st.button(
             "Process documents",
             type="primary",
@@ -90,11 +113,25 @@ def render_sidebar() -> None:
                 st.error("GOOGLE_API_KEY or GEMINI_API_KEY was not found in the `.env` file.")
             else:
                 with st.status("Preparing documents...", expanded=True) as document_status:
-                    st.write("Validating files and extracting text...")
+                    st.write("Validating files and checking for a text layer...")
+                    ocr_runtime_signature = ("", "", ())
+                    if enable_ocr:
+                        st.write(
+                            "Trying local OCR for PDFs with no selectable text. "
+                            "This may take a while..."
+                        )
+                        ocr_runtime_signature = (
+                            pdf_service.get_ocr_runtime_signature()
+                        )
                     file_payloads = pdf_service.create_file_payloads(files)
                     file_fingerprints = pdf_service.file_fingerprints(file_payloads)
                     pages, rejected_files, processed_names = (
-                        pdf_service.process_pdf_payloads(file_payloads)
+                        pdf_service.process_pdf_payloads(
+                            file_payloads,
+                            enable_ocr=enable_ocr,
+                            ocr_language=ocr_language or "eng+tur",
+                            ocr_runtime_signature=ocr_runtime_signature,
+                        )
                     )
                     if rejected_files:
                         st.warning(
@@ -104,7 +141,7 @@ def render_sidebar() -> None:
                     chunks = rag_service.split_documents(pages) if pages else []
                     if not chunks:
                         document_status.update(
-                            label="No documents were processed.", state="error"
+                            label="No processable documents were found.", state="error"
                         )
                         st.error("No processable text was found. Try a text-based PDF.")
                     else:

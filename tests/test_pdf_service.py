@@ -1,4 +1,7 @@
 import hashlib
+import subprocess
+from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import config
@@ -157,5 +160,209 @@ def test_same_payload_uses_cached_pdf_extraction() -> None:
             second = pdf_service.process_pdf_payloads(payloads)
         assert first == second
         assert calls == 1
+    finally:
+        pdf_service.process_pdf_payloads.clear()
+
+
+def test_text_pdf_does_not_require_or_run_ocr() -> None:
+    class Reader:
+        is_encrypted = False
+        pages = [FakePage("Existing text")]
+
+        def __init__(self, uploaded_file) -> None:
+            pass
+
+    with (
+        patch.object(pdf_service, "PdfReader", Reader),
+        patch.object(
+            pdf_service,
+            "run_local_ocr",
+            side_effect=AssertionError("OCR must not run"),
+        ),
+    ):
+        documents, errors, names = pdf_service.extract_pdf_pages(
+            [make_upload()], enable_ocr=True
+        )
+
+    assert errors == []
+    assert names == ["document.pdf"]
+    assert [document.page_content for document in documents] == ["Existing text"]
+
+
+def test_partially_textless_pdf_is_out_of_scope_for_ocr() -> None:
+    class Reader:
+        is_encrypted = False
+        pages = [FakePage("Selectable text"), FakePage(None)]
+
+        def __init__(self, uploaded_file) -> None:
+            pass
+
+    with (
+        patch.object(pdf_service, "PdfReader", Reader),
+        patch.object(
+            pdf_service,
+            "run_local_ocr",
+            side_effect=AssertionError("OCR must not run for a partially textless PDF"),
+        ),
+    ):
+        documents, errors, _ = pdf_service.extract_pdf_pages(
+            [make_upload()], enable_ocr=True
+        )
+
+    assert errors == []
+    assert [document.page_content for document in documents] == ["Selectable text"]
+
+
+def test_fully_textless_pdf_uses_ocr_and_preserves_metadata() -> None:
+    class Reader:
+        is_encrypted = False
+
+        def __init__(self, uploaded_file) -> None:
+            content = uploaded_file.getvalue()
+            self.pages = [FakePage("OCR text")] if content == b"%PDF-ocr" else [FakePage(None)]
+
+    with (
+        patch.object(pdf_service, "PdfReader", Reader),
+        patch.object(
+            pdf_service,
+            "run_local_ocr",
+            return_value=(b"%PDF-ocr", None),
+        ) as run_ocr,
+    ):
+        documents, errors, names = pdf_service.extract_pdf_pages(
+            [make_upload(name="scan.pdf")],
+            enable_ocr=True,
+            ocr_language="eng+tur",
+            ocr_runtime_signature=("/opt/ocrmypdf", "/opt/tesseract", ("eng", "tur")),
+        )
+
+    run_ocr.assert_called_once()
+    assert errors == []
+    assert names == ["scan.pdf"]
+    assert documents[0].page_content == "OCR text"
+    assert documents[0].metadata == {"source": "scan.pdf", "page": 1}
+
+
+def test_page_limit_is_checked_before_ocr(monkeypatch) -> None:
+    monkeypatch.setattr(config, "MAX_TOTAL_PAGES", 1)
+
+    class Reader:
+        is_encrypted = False
+        pages = [FakePage(None), FakePage(None)]
+
+        def __init__(self, uploaded_file) -> None:
+            pass
+
+    with (
+        patch.object(pdf_service, "PdfReader", Reader),
+        patch.object(
+            pdf_service,
+            "run_local_ocr",
+            side_effect=AssertionError("OCR must not run before limits pass"),
+        ),
+    ):
+        documents, errors, names = pdf_service.extract_pdf_pages(
+            [make_upload()], enable_ocr=True
+        )
+
+    assert documents == []
+    assert names == []
+    assert "total limit of 1 pages" in errors[0]
+
+
+def test_missing_ocr_tools_and_language_return_installation_guidance() -> None:
+    _, error = pdf_service.run_local_ocr(b"%PDF-test", "eng", ("", "", ()))
+    assert error == pdf_service.OCR_INSTALL_MESSAGE
+    assert "brew install ocrmypdf" in error
+
+    _, error = pdf_service.run_local_ocr(
+        b"%PDF-test",
+        "tur",
+        ("/opt/ocrmypdf", "/opt/tesseract", ("eng",)),
+    )
+    assert "brew install tesseract-lang" in error
+
+
+def test_ocr_command_is_argument_based_and_uses_temporary_paths() -> None:
+    captured = {}
+
+    def fake_run(command, **kwargs):
+        captured["command"] = command
+        captured["kwargs"] = kwargs
+        Path(command[-1]).write_bytes(b"%PDF-ocr-output")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    with patch.object(pdf_service.subprocess, "run", side_effect=fake_run):
+        output, error = pdf_service.run_local_ocr(
+            b"%PDF-input",
+            "eng+tur",
+            ("/opt/ocrmypdf", "/opt/tesseract", ("eng", "tur")),
+        )
+
+    assert error is None
+    assert output == b"%PDF-ocr-output"
+    assert captured["command"][:3] == [
+        "/opt/ocrmypdf",
+        "--language",
+        "eng+tur",
+    ]
+    assert captured["kwargs"]["shell"] is False
+    assert captured["kwargs"]["timeout"] == config.OCR_TIMEOUT_SECONDS
+    assert "document.pdf" not in captured["command"]
+
+
+def test_ocr_timeout_returns_simple_error() -> None:
+    with patch.object(
+        pdf_service.subprocess,
+        "run",
+        side_effect=subprocess.TimeoutExpired("ocrmypdf", 1),
+    ):
+        output, error = pdf_service.run_local_ocr(
+            b"%PDF-input",
+            "eng",
+            ("/opt/ocrmypdf", "/opt/tesseract", ("eng",)),
+        )
+
+    assert output is None
+    assert error == "OCR timed out. Try a smaller PDF."
+
+
+def test_same_scanned_pdf_uses_cached_ocr_result() -> None:
+    ocr_calls = 0
+
+    class Reader:
+        is_encrypted = False
+
+        def __init__(self, uploaded_file) -> None:
+            content = uploaded_file.getvalue()
+            self.pages = [FakePage("OCR text")] if content == b"%PDF-ocr" else [FakePage(None)]
+
+    def fake_ocr(content, language, runtime_signature):
+        nonlocal ocr_calls
+        ocr_calls += 1
+        return b"%PDF-ocr", None
+
+    payloads = pdf_service.create_file_payloads([make_upload(content=b"%PDF-scan")])
+    runtime_signature = ("/opt/ocrmypdf", "/opt/tesseract", ("eng", "tur"))
+    pdf_service.process_pdf_payloads.clear()
+    try:
+        with (
+            patch.object(pdf_service, "PdfReader", Reader),
+            patch.object(pdf_service, "run_local_ocr", side_effect=fake_ocr),
+        ):
+            first = pdf_service.process_pdf_payloads(
+                payloads,
+                enable_ocr=True,
+                ocr_language="eng+tur",
+                ocr_runtime_signature=runtime_signature,
+            )
+            second = pdf_service.process_pdf_payloads(
+                payloads,
+                enable_ocr=True,
+                ocr_language="eng+tur",
+                ocr_runtime_signature=runtime_signature,
+            )
+        assert first == second
+        assert ocr_calls == 1
     finally:
         pdf_service.process_pdf_payloads.clear()

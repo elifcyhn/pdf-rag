@@ -27,6 +27,32 @@ streamlit run app.py
 
 Note: Text cannot be extracted from scanned PDFs unless they contain an OCR text layer.
 
+## Optional local OCR on macOS
+
+Local OCR is disabled by default. Enable it from the sidebar to process PDFs that
+contain no selectable text on any page. PDFs that already contain text keep using
+the normal fast path. Partially scanned PDFs are outside the scope of this version.
+
+Install OCRmyPDF and the additional Tesseract language packs with Homebrew:
+
+```bash
+brew update
+brew install ocrmypdf
+brew install tesseract-lang
+```
+
+Verify English and Turkish language support:
+
+```bash
+ocrmypdf --version
+tesseract --version
+tesseract --list-langs
+```
+
+The language list should contain `eng` and `tur`. OCR input and output are handled
+in a temporary directory and are deleted after processing. OCR can be CPU-intensive
+and may take significantly longer than normal text extraction.
+
 ## Tests
 
 ```bash

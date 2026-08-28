@@ -15,3 +15,12 @@ CHAT_TEMPERATURE = 0.2
 
 CACHE_TTL_SECONDS = 3600
 CACHE_MAX_ENTRIES = 32
+
+OCR_ENABLED_DEFAULT = False
+OCR_TIMEOUT_SECONDS = 300
+OCR_LANGUAGES = {
+    "English": "eng",
+    "Turkish": "tur",
+    "English + Turkish": "eng+tur",
+}
+OCR_DEFAULT_LANGUAGE = "English + Turkish"

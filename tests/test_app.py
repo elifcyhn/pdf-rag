@@ -72,6 +72,27 @@ def test_streamlit_smoke_without_api_or_network() -> None:
     assert {"Process documents", "Clear documents", "Clear chat"}.issubset(
         {button.label for button in at.button}
     )
+    assert [checkbox.label for checkbox in at.checkbox] == [
+        "Use local OCR for scanned PDFs"
+    ]
+    assert not at.checkbox[0].value
+    assert not at.selectbox
+
+
+def test_enabling_ocr_shows_turkish_language_options() -> None:
+    at = AppTest.from_file(APP_PATH).run(timeout=20)
+
+    at.checkbox[0].check().run(timeout=20)
+
+    assert not at.exception
+    assert [selectbox.label for selectbox in at.selectbox] == ["OCR language"]
+    assert at.selectbox[0].options == [
+        "English",
+        "Turkish",
+        "English + Turkish",
+    ]
+    assert at.selectbox[0].value == "English + Turkish"
+    assert any("OCR may take a while" in caption.value for caption in at.caption)
 
 
 def test_empty_pdf_upload_path_does_not_call_gemini() -> None:
